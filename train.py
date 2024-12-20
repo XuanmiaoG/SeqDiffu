@@ -1,123 +1,94 @@
-"""
-Train a diffusion model on images.
-"""
-
-import argparse
-import json
-import torch
-import os
 import numpy as np
-from diffuseq.utils import dist_util, logger
-from diffuseq.text_datasets import load_data_text
-from diffuseq.step_sample import create_named_schedule_sampler
-from basic_utils import (
-    load_defaults_config,
-    create_model_and_diffusion,
-    args_to_dict,
-    add_dict_to_argparser,
-    load_model_emb,
-    load_tokenizer
-)
-from train_util import TrainLoop
-from transformers import set_seed
-import wandb
+import torch as th
+import torch.distributed as dist
+from abc import ABC, abstractmethod
 
-### custom your wandb setting here ###
-# os.environ["WANDB_API_KEY"] = ""
-os.environ["WANDB_MODE"] = "offline"
+def create_named_schedule_sampler(name, diffusion):
+    if name == "uniform":
+        return UniformSampler(diffusion)
+    elif name == "lossaware":
+        return LossSecondMomentResampler(diffusion)
+    elif name == "fixstep":
+        return FixSampler(diffusion)
+    else:
+        raise NotImplementedError(f"Unknown schedule sampler: {name}")
 
-def create_argparser():
-    defaults = dict()
-    defaults.update(load_defaults_config())
-    parser = argparse.ArgumentParser()
-    add_dict_to_argparser(parser, defaults)  # Update args dynamically
-    return parser
+class ScheduleSampler(ABC):
+    @abstractmethod
+    def weights(self):
+        pass
 
-def main():
-    args = create_argparser().parse_args()
-    set_seed(args.seed)
-    dist_util.setup_dist()
-    logger.configure()
+    def sample(self, batch_size, device):
+        w = self.weights()
+        p = w / np.sum(w)
+        indices_np = np.random.choice(len(p), size=(batch_size,), p=p)
+        indices = th.from_numpy(indices_np).long().to(device)
+        weights_np = 1 / (len(p) * p[indices_np])
+        weights = th.from_numpy(weights_np).float().to(device)
+        return indices, weights
 
-    if args.num_scales <= 0:
-        raise ValueError("num_scales must be greater than 0 for multi-scale diffusion.")
+class UniformSampler(ScheduleSampler):
+    def __init__(self, diffusion):
+        self.diffusion = diffusion
+        self._weights = np.ones([diffusion.num_timesteps])
 
-    logger.log("### Creating data loader...")
-    tokenizer = load_tokenizer(args)
-    model_weight, tokenizer = load_model_emb(args, tokenizer)
+    def weights(self):
+        return self._weights
 
-    data = load_data_text(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        data_args=args,
-        loaded_vocab=tokenizer,
-        model_emb=model_weight
-    )
-    next(data)
+class FixSampler(ScheduleSampler):
+    def __init__(self, diffusion):
+        self.diffusion = diffusion
+        self._weights = np.concatenate([np.ones([diffusion.num_timesteps // 2]), np.zeros([diffusion.num_timesteps // 2]) + 0.5])
 
-    data_valid = load_data_text(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        data_args=args,
-        split='valid',
-        deterministic=True,
-        loaded_vocab=tokenizer,
-        model_emb=model_weight
-    )
+    def weights(self):
+        return self._weights
 
-    logger.log("### Creating model...")
-    model, _ = create_model_and_diffusion(**args_to_dict(args))
-    model.to(dist_util.dev())
+class LossAwareSampler(ScheduleSampler):
+    def update_with_local_losses(self, local_ts, local_losses):
+        batch_sizes = [
+            th.tensor([0], dtype=th.int32, device=local_ts.device)
+            for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(batch_sizes, th.tensor([len(local_ts)], dtype=th.int32, device=local_ts.device))
+        batch_sizes = [x.item() for x in batch_sizes]
+        max_bs = max(batch_sizes)
+        timestep_batches = [th.zeros(max_bs).to(local_ts) for bs in batch_sizes]
+        loss_batches = [th.zeros(max_bs).to(local_losses) for bs in batch_sizes]
+        dist.all_gather(timestep_batches, local_ts)
+        dist.all_gather(loss_batches, local_losses)
+        timesteps = [x.item() for y, bs in zip(timestep_batches, batch_sizes) for x in y[:bs]]
+        losses = [x.item() for y, bs in zip(loss_batches, batch_sizes) for x in y[:bs]]
+        self.update_with_all_losses(timesteps, losses)
 
-    logger.log("### Creating multi-scale diffusion...")
-    multi_scale_diffusions = []
-    for scale in range(args.num_scales):
-        scale_args = {f"scale{scale}_{k}": v for k, v in args_to_dict(args).items()}
-        logger.log(f"### Scale {scale} configuration: {json.dumps(scale_args, indent=2)}")
-        _, diffusion = create_model_and_diffusion(**scale_args)
-        multi_scale_diffusions.append(diffusion)
+    @abstractmethod
+    def update_with_all_losses(self, ts, losses):
+        pass
 
-    pytorch_total_params = sum(p.numel() for p in model.parameters())
-    logger.log(f"### The parameter count is {pytorch_total_params}")
+class LossSecondMomentResampler(LossAwareSampler):
+    def __init__(self, diffusion, history_per_term=10, uniform_prob=0.001):
+        self.diffusion = diffusion
+        self.history_per_term = history_per_term
+        self.uniform_prob = uniform_prob
+        self._loss_history = np.zeros([diffusion.num_timesteps, history_per_term], dtype=np.float64)
+        self._loss_counts = np.zeros([diffusion.num_timesteps], dtype=np.int32)
 
-    schedule_samplers = [
-        create_named_schedule_sampler(args.schedule_sampler, diffusion)
-        for diffusion in multi_scale_diffusions
-    ]
+    def weights(self):
+        if not self._warmed_up():
+            return np.ones([self.diffusion.num_timesteps], dtype=np.float64)
+        weights = np.sqrt(np.mean(self._loss_history ** 2, axis=-1))
+        weights /= np.sum(weights)
+        weights *= 1 - self.uniform_prob
+        weights += self.uniform_prob / len(weights)
+        return weights
 
-    logger.log(f"### Saving the hyperparameters to {args.checkpoint_path}/training_args.json")
-    with open(f"{args.checkpoint_path}/training_args.json", "w") as f:
-        json.dump(args.__dict__, f, indent=2)
+    def update_with_all_losses(self, ts, losses):
+        for t, loss in zip(ts, losses):
+            if self._loss_counts[t] == self.history_per_term:
+                self._loss_history[t, :-1] = self._loss_history[t, 1:]
+                self._loss_history[t, -1] = loss
+            else:
+                self._loss_history[t, self._loss_counts[t]] = loss
+                self._loss_counts[t] += 1
 
-    if ('LOCAL_RANK' not in os.environ) or (int(os.environ['LOCAL_RANK']) == 0):
-        wandb.init(
-            project=os.getenv("WANDB_PROJECT", "DiffuSeq"),
-            name=args.checkpoint_path,
-        )
-        wandb.config.update(args.__dict__, allow_val_change=True)
-
-    logger.log("### Training...")
-    TrainLoop(
-        model=model,
-        multi_scale_diffusions=multi_scale_diffusions,
-        data=data,
-        batch_size=args.batch_size,
-        microbatch=args.microbatch,
-        lr=args.lr,
-        ema_rate=args.ema_rate,
-        log_interval=args.log_interval,
-        save_interval=args.save_interval,
-        resume_checkpoint=args.resume_checkpoint,
-        use_fp16=args.use_fp16,
-        fp16_scale_growth=args.fp16_scale_growth,
-        schedule_sampler=schedule_samplers,
-        weight_decay=args.weight_decay,
-        learning_steps=args.learning_steps,
-        checkpoint_path=args.checkpoint_path,
-        gradient_clipping=args.gradient_clipping,
-        eval_data=data_valid,
-        eval_interval=args.eval_interval
-    ).run_loop()
-
-if __name__ == "__main__":
-    main()
+    def _warmed_up(self):
+        return (self._loss_counts == self.history_per_term).all()
